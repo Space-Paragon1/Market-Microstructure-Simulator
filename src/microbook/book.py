@@ -40,6 +40,25 @@ class LimitOrderBook:
     def best_bid(self) -> Optional[float]:
         return self._bid_prices[0] if self._bid_prices else None
 
+    def top_of_book(self) -> dict:
+        return {
+            "best_bid": self.best_bid(),
+            "best_ask": self.best_ask(),
+            "mid": self.midprice(),
+        }
+
+    def depth(self, levels: int = 5) -> dict:
+        bids = [
+            (p, sum(o.qty for o in self._bids[p]))
+            for p in self._bid_prices[:levels]
+        ]
+        asks = [
+            (p, sum(o.qty for o in self._asks[p]))
+            for p in self._ask_prices[:levels]
+        ]
+        return {"bids": bids, "asks": asks}
+
+
     def best_ask(self) -> Optional[float]:
         return self._ask_prices[0] if self._ask_prices else None
 
@@ -66,6 +85,19 @@ class LimitOrderBook:
         if order.qty > 0:
             self._rest(order)
         return fills
+    
+    def place_market(self, order: Order) -> List[Fill]:
+        """
+        Market order: consumes liquidity immediately and NEVER rests.
+        """
+        if order.side == Side.BUY:
+            # cross any ask
+            order.price = float("inf")
+            return self._match_buy(order)
+        else:
+            # cross any bid
+            order.price = 0.0
+            return self._match_sell(order)
 
     def cancel(self, order_id: str) -> bool:
         """
@@ -105,6 +137,54 @@ class LimitOrderBook:
             return True
 
         return False
+    
+    def modify(
+    self,
+    order_id: str,
+    *,
+    new_price: float | None = None,
+    new_qty: int | None = None,
+    ts: int,
+) -> bool:
+        info = self._id_map.get(order_id)
+        if info is None:
+            return False
+
+        side, price = info
+        book = self._bids if side == Side.BUY else self._asks
+        q = book.get(price)
+        if q is None:
+            return False
+
+        target = None
+        for o in q:
+            if o.order_id == order_id:
+                target = o
+                break
+        if target is None:
+            return False
+
+        # Case 1: qty reduction only → keep priority
+        if new_price is None and new_qty is not None and new_qty < target.qty:
+            target.qty = new_qty
+            return True
+
+        # Otherwise: lose priority → cancel + reinsert
+        self.cancel(order_id)
+
+        price2 = new_price if new_price is not None else target.price
+        qty2 = new_qty if new_qty is not None else target.qty
+
+        self.place_limit(
+            Order(
+                order_id=order_id,
+                side=side,
+                price=price2,
+                qty=qty2,
+                ts=ts,
+            )
+        )
+        return True
 
     # --------- Internal helpers ---------
 
