@@ -8,6 +8,7 @@ from microbook import LimitOrderBook, Order
 from microbook.types import Fill, Side
 from .events import Event, EventType
 from .strategy import Strategy
+from .analytics import TimeSeries
 
 
 @dataclass
@@ -31,6 +32,8 @@ class MarketSimulator:
         self._pq: List[Event] = []
         self._seq = 0
         self.now = 0
+        self.ts = TimeSeries()
+
 
         # order_id -> (strategy_index, Side)
         self._order_owner: Dict[str, Tuple[int, Side]] = {}
@@ -93,6 +96,7 @@ class MarketSimulator:
                     "top": self.lob.top_of_book(),
                     "depth": self.lob.depth(levels=5),
                 }
+                self.ts.record(self.now, self.lob)
                 out.snapshots.append(snap)
 
                 # Let strategies act on each snapshot tick
