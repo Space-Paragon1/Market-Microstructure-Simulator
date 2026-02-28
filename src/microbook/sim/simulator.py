@@ -84,9 +84,12 @@ class MarketSimulator:
 
                 out.fills.extend(fills)
 
-                # record total market volume into each strategy's metrics (simple baseline)
+                # record total market volume into each strategy's metrics
                 for m in self.exec_metrics.values():
                     m.record_market_volume(fills)
+
+                # Midprice after matching (for spread-capture attribution)
+                mid_now = self.lob.midprice()
 
                 # Attribute fills to strategies (portfolio + execution metrics)
                 for f in fills:
@@ -95,14 +98,18 @@ class MarketSimulator:
                         idx, side = self._order_owner[f.maker_order_id]
                         strat = self.strategies[idx]
                         strat.portfolio.on_fill(f, f.maker_order_id, side)
-                        self.exec_metrics[strat.name].on_fill(f, side)
+                        self.exec_metrics[strat.name].on_fill(
+                            f, side, is_maker=True, mid=mid_now
+                        )
 
                     # taker side
                     if f.taker_order_id in self._order_owner:
                         idx, side = self._order_owner[f.taker_order_id]
                         strat = self.strategies[idx]
                         strat.portfolio.on_fill(f, f.taker_order_id, side)
-                        self.exec_metrics[strat.name].on_fill(f, side)
+                        self.exec_metrics[strat.name].on_fill(
+                            f, side, is_maker=False, mid=mid_now
+                        )
 
             elif ev.etype == EventType.CANCEL:
                 assert ev.order_id is not None
@@ -125,10 +132,17 @@ class MarketSimulator:
                 out.snapshots.append(snap)
 
                 # Let strategies act on each snapshot tick
+                arrival_mid = self.lob.midprice()
                 for strat in self.strategies:
                     actions = strat.on_tick(self.now, self.lob)
                     for a in actions:
                         self.schedule(a.time, a.etype, **a.kwargs)
+                        # record order decisions with arrival mid for slippage tracking
+                        if a.etype == EventType.SUBMIT and a.kwargs.get("order") is not None:
+                            o = a.kwargs["order"]
+                            self.exec_metrics[strat.name].record_order(
+                                o.order_id, o.side, o.qty, arrival_mid or 0.0
+                            )
 
                 # Record MTM PnL over time (once per snapshot)
                 if not hasattr(out, "pnl_series"):
