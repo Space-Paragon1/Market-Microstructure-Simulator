@@ -36,13 +36,12 @@ def main():
     res = sim.run(until=500)
     print("=== EXECUTION METRICS ===")
     for name, m in sim.exec_metrics.items():
-        print(
-            name,
-            "market_volume=", m.market_volume,
-            "filled_qty=", m.filled_qty,
-            "buy_qty=", m.buy_qty,
-            "sell_qty=", m.sell_qty,
-        )
+        s = m.summary()
+        print(f"
+--- {name} ---")
+        for k, v in s.items():
+            val = f"{v:.4f}" if isinstance(v, float) else str(v)
+            print(f"  {k:<30} {val}")
 
     
 
