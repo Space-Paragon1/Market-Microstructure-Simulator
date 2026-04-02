@@ -48,6 +48,9 @@ class ExecutionMetrics:
         # qty-weighted arrival-mid accumulator per direction
         self._buy_arrival_mid_notional: float = 0.0   # sum(qty * arrival_mid) for buy fills
         self._sell_arrival_mid_notional: float = 0.0
+        # qty that actually had a registered arrival_mid (distinct from notional=0 when mid=0)
+        self._buy_arrival_mid_qty: int = 0
+        self._sell_arrival_mid_qty: int = 0
 
         # fill-ratio denominator: track submitted qty from registered orders
         self._submitted_qty: int = 0
@@ -116,8 +119,10 @@ class ExecutionMetrics:
             _, _, arrival_mid = rec
             if my_side == Side.BUY:
                 self._buy_arrival_mid_notional += arrival_mid * qty
+                self._buy_arrival_mid_qty += qty
             else:
                 self._sell_arrival_mid_notional += arrival_mid * qty
+                self._sell_arrival_mid_qty += qty
 
     # ------------------------------------------------------------------ #
     # Computed metrics                                                     #
@@ -160,7 +165,7 @@ class ExecutionMetrics:
         Positive means we paid above the decision-time mid (cost).
         Only defined when buys were attributed to registered orders.
         """
-        if self._buy_qty == 0 or self._buy_arrival_mid_notional == 0.0:
+        if self._buy_qty == 0 or self._buy_arrival_mid_qty == 0:
             return None
         arrival_vwap = self._buy_arrival_mid_notional / self._buy_qty
         vwap = self._buy_notional / self._buy_qty
@@ -171,7 +176,7 @@ class ExecutionMetrics:
         VWAP slippage for sells vs arrival midprice.
         Positive means we received below the decision-time mid (cost).
         """
-        if self._sell_qty == 0 or self._sell_arrival_mid_notional == 0.0:
+        if self._sell_qty == 0 or self._sell_arrival_mid_qty == 0:
             return None
         arrival_vwap = self._sell_arrival_mid_notional / self._sell_qty
         vwap = self._sell_notional / self._sell_qty

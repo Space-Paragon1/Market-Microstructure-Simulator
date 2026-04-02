@@ -160,9 +160,9 @@ class TWAPExecutor(Strategy):
         if remaining <= 0:
             return []
 
-        # number of slices left (inclusive)
+        # number of slices left (inclusive); on the last slice send all remaining
         slices_left = max(1, ((self.end - now) // self.tick_interval) + 1)
-        qty = max(1, remaining // slices_left)
+        qty = remaining if slices_left == 1 else max(1, remaining // slices_left)
 
         oid = f"{self.name}_{now}"
         o = Order(oid, self.side, 1.0, qty, ts=self._next_ts(now))

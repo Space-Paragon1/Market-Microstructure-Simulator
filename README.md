@@ -24,6 +24,7 @@ first**, followed by performance, analytics, and realism.
   - Modify with correct priority semantics:
     - Quantity reduction → retains queue priority
     - Quantity increase or price change → loses priority (re-queued)
+    - Quantity to zero → treated as cancel
 
 ### 2. Event-Driven Market Simulator
 - Discrete-event loop driven by a priority queue `(time, sequence)`
@@ -136,7 +137,7 @@ pip install pytest matplotlib
 python -m pytest -q
 ```
 
-35 tests, all passing.
+38 tests, all passing.
 
 ---
 

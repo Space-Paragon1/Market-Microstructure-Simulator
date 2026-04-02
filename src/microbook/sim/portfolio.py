@@ -46,8 +46,9 @@ class Portfolio:
                 # covering short -> realize pnl on covered amount
                 cover = min(qty, -self.position)
                 self.realized_pnl += (self.avg_cost - px) * cover  # short profit if buy lower
-                # if flips to long, set avg_cost for remaining
-                if new_pos > 0:
+                if new_pos == 0:
+                    self.avg_cost = 0.0
+                elif new_pos > 0:
                     self.avg_cost = px
 
             self.position = new_pos
@@ -66,7 +67,9 @@ class Portfolio:
                 # selling long -> realize pnl on sold amount
                 sold = min(qty, self.position)
                 self.realized_pnl += (px - self.avg_cost) * sold
-                if new_pos < 0:
+                if new_pos == 0:
+                    self.avg_cost = 0.0
+                elif new_pos < 0:
                     self.avg_cost = px  # flipped to short
 
             self.position = new_pos

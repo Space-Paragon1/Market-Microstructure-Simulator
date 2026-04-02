@@ -87,11 +87,9 @@ class LimitOrderBook:
         - Never rests on the book
         """
         if order.side == Side.BUY:
-            order.price = float("inf")  # crosses any ask
-            return self._match_buy(order)
+            return self._match_buy(order, crossing_price=float("inf"))
         else:
-            order.price = 0.0  # crosses any bid
-            return self._match_sell(order)
+            return self._match_sell(order, crossing_price=0.0)
 
     def cancel(self, order_id: str) -> bool:
         """
@@ -179,6 +177,10 @@ class LimitOrderBook:
         if target is None:
             return False
 
+        # qty=0 means cancel
+        if new_qty == 0:
+            return self.cancel(order_id)
+
         # qty reduction only (keeps priority)
         if new_price is None and new_qty is not None and 0 < new_qty < target.qty:
             delta = target.qty - new_qty
@@ -217,13 +219,14 @@ class LimitOrderBook:
         agg[order.price] = agg.get(order.price, 0) + order.qty
         self._id_map[order.order_id] = (order.side, order.price)
 
-    def _match_buy(self, buy: Order) -> List[Fill]:
+    def _match_buy(self, buy: Order, *, crossing_price: Optional[float] = None) -> List[Fill]:
         fills: List[Fill] = []
+        effective_price = crossing_price if crossing_price is not None else buy.price
 
-        # Buy crosses if best ask <= buy.price
+        # Buy crosses if best ask <= effective_price
         while buy.qty > 0 and self._ask_prices:
             best_ask = self._ask_prices[0]
-            if best_ask > buy.price:
+            if best_ask > effective_price:
                 break
 
             ask_q = self._asks[best_ask]
@@ -256,13 +259,14 @@ class LimitOrderBook:
 
         return fills
 
-    def _match_sell(self, sell: Order) -> List[Fill]:
+    def _match_sell(self, sell: Order, *, crossing_price: Optional[float] = None) -> List[Fill]:
         fills: List[Fill] = []
+        effective_price = crossing_price if crossing_price is not None else sell.price
 
-        # Sell crosses if best bid >= sell.price
+        # Sell crosses if best bid >= effective_price
         while sell.qty > 0 and self._bid_prices:
             best_bid = self._bid_prices[0]
-            if best_bid < sell.price:
+            if best_bid < effective_price:
                 break
 
             bid_q = self._bids[best_bid]
