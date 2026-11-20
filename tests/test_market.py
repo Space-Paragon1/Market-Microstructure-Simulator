@@ -1,5 +1,6 @@
 from microbook import LimitOrderBook, Order, Side
 
+
 def test_market_buy_consumes_and_does_not_rest():
     lob = LimitOrderBook()
     lob.place_limit(Order("s1", Side.SELL, 101.0, 3, ts=1))

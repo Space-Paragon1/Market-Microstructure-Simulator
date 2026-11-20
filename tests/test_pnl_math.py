@@ -1,6 +1,6 @@
+from microbook import Side
 from microbook.sim.portfolio import Portfolio
 from microbook.types import Fill
-from microbook import Side
 
 
 def test_realized_pnl_long_roundtrip():

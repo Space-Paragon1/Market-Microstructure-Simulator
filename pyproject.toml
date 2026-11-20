@@ -1,9 +1,81 @@
+[build-system]
+requires = ["hatchling>=1.21"]
+build-backend = "hatchling.build"
+
 [project]
 name = "microstructure-sim"
-version = "0.1.0"
+version = "0.2.0"
+description = "Price-time priority limit order book and event-driven market microstructure simulator"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Alex Chidera Umeasalugo" }]
 requires-python = ">=3.10"
 dependencies = []
+keywords = ["order book", "matching engine", "market microstructure", "market making", "simulation", "backtesting"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+plot = ["matplotlib>=3.7"]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "hypothesis>=6.100",
+    "ruff>=0.6",
+    "mypy>=1.10",
+    "matplotlib>=3.7",
+]
+
+[project.urls]
+Repository = "https://github.com/Space-Paragon1/Market-Microstructure-Simulator"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/microbook"]
+
+# --------------------------------------------------------------------------- #
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers"]
+
+[tool.coverage.run]
+source = ["microbook"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = ["if TYPE_CHECKING:", "raise NotImplementedError", "pragma: no cover"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+src = ["src", "tests", "examples", "benchmarks"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF", "PERF", "C4", "PT"]
+ignore = [
+    "RUF001", "RUF002", "RUF003",  # unicode look-alikes in prose (e.g. "x", "-") are intentional
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B018", "SIM117", "PT011", "PT018", "B905"]
+"benchmarks/*" = ["E402"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/microbook"]
+warn_unreachable = true
