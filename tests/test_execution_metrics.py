@@ -10,22 +10,23 @@ Covers:
 - Average execution price and total notional
 - Integration: metrics wired into MarketSimulator
 """
+
 from __future__ import annotations
 
 import pytest
 
-from microbook import LimitOrderBook, Order, Side
-from microbook.types import Fill
-from microbook.sim.execution_metrics import ExecutionMetrics
-from microbook.sim.simulator import MarketSimulator
+from microbook import Order, Side
 from microbook.sim.events import EventType
-from microbook.sim.strategy import MarketMaker, TWAPExecutor
+from microbook.sim.execution_metrics import ExecutionMetrics
 from microbook.sim.orderflow import FlowConfig, PoissonOrderFlow
-
+from microbook.sim.simulator import MarketSimulator
+from microbook.sim.strategy import MarketMaker, TWAPExecutor
+from microbook.types import Fill
 
 # ------------------------------------------------------------------ #
 # Unit tests: ExecutionMetrics in isolation                           #
 # ------------------------------------------------------------------ #
+
 
 class TestVWAP:
     def test_buy_vwap_single_fill(self):
@@ -124,8 +125,15 @@ class TestSpreadCapture:
     def test_spread_capture_none_without_mid(self):
         m = ExecutionMetrics()
         m.on_fill(Fill("t1", "m1", 99.0, 5), Side.BUY, is_maker=True, mid=None)
-        # mid unknown -> spread total stays 0, spread_capture = 0 / 5 = 0.0
-        assert m.spread_capture_per_share() == pytest.approx(0.0)
+        # mid unknown -> the fill carries no spread information and is excluded
+        # (previously it diluted the average toward 0.0)
+        assert m.spread_capture_per_share() is None
+
+    def test_spread_capture_ignores_fills_without_mid(self):
+        m = ExecutionMetrics()
+        m.on_fill(Fill("t1", "m1", 99.0, 5), Side.BUY, is_maker=True, mid=100.0)
+        m.on_fill(Fill("t2", "m2", 99.0, 5), Side.BUY, is_maker=True, mid=None)
+        assert m.spread_capture_per_share() == pytest.approx(1.0)
 
 
 class TestFillRatio:
@@ -169,10 +177,20 @@ class TestSummaryDict:
         m = ExecutionMetrics()
         s = m.summary()
         expected_keys = {
-            "filled_qty", "buy_qty", "sell_qty", "maker_qty", "taker_qty",
-            "total_notional", "avg_price", "buy_vwap", "sell_vwap",
-            "buy_slippage_vs_arrival", "sell_slippage_vs_arrival",
-            "spread_capture_per_share", "fill_ratio", "market_volume",
+            "filled_qty",
+            "buy_qty",
+            "sell_qty",
+            "maker_qty",
+            "taker_qty",
+            "total_notional",
+            "avg_price",
+            "buy_vwap",
+            "sell_vwap",
+            "buy_slippage_vs_arrival",
+            "sell_slippage_vs_arrival",
+            "spread_capture_per_share",
+            "fill_ratio",
+            "market_volume",
             "participation_rate",
         }
         assert expected_keys == set(s.keys())
@@ -200,6 +218,7 @@ class TestSummaryDict:
 # ------------------------------------------------------------------ #
 # Integration tests: metrics wired into MarketSimulator               #
 # ------------------------------------------------------------------ #
+
 
 class TestSimulatorMetricsIntegration:
     def _build_sim(self) -> MarketSimulator:
@@ -242,8 +261,7 @@ class TestSimulatorMetricsIntegration:
 
     def test_twap_taker_slippage_tracked(self):
         """TWAP as pure taker: buy slippage should be defined."""
-        twap = TWAPExecutor(Side.BUY, total_qty=20, start=10, end=100,
-                            tick_interval=10, name="twap")
+        twap = TWAPExecutor(Side.BUY, total_qty=20, start=10, end=100, tick_interval=10, name="twap")
         sim = MarketSimulator(strategies=[twap])
         sim.schedule(0, EventType.SUBMIT, order=Order("s_ask", Side.SELL, 101.0, 100, ts=0))
         sim.schedule(0, EventType.SUBMIT, order=Order("s_bid", Side.BUY, 99.0, 100, ts=0))

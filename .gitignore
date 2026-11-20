@@ -23,6 +23,7 @@ MANIFEST
 
 # Testing & coverage
 .pytest_cache/
+.hypothesis/
 .coverage
 .coverage.*
 htmlcov/

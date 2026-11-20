@@ -1,22 +1,20 @@
+"""Order-book state metrics."""
+
 from __future__ import annotations
-from typing import Dict, Optional
 
 from microbook import LimitOrderBook
 
 
-def spread(lob: LimitOrderBook) -> Optional[float]:
-    b = lob.best_bid()
-    a = lob.best_ask()
-    if b is None or a is None:
-        return None
-    return a - b
+def spread(lob: LimitOrderBook) -> float | None:
+    """Best ask minus best bid (``None`` if either side is empty)."""
+    return lob.spread()
 
 
-def imbalance(lob: LimitOrderBook, levels: int = 3) -> Optional[float]:
+def imbalance(lob: LimitOrderBook, levels: int = 3) -> float | None:
+    """Depth imbalance over the top ``levels``: (bid qty - ask qty) / total, in [-1, 1].
+    Positive means more resting size on the bid (buying pressure)."""
     d = lob.depth(levels=levels)
     bids = sum(q for _, q in d["bids"])
     asks = sum(q for _, q in d["asks"])
     total = bids + asks
-    if total == 0:
-        return None
-    return (bids - asks) / total
+    return None if total == 0 else (bids - asks) / total

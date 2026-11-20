@@ -1,147 +1,298 @@
+"""Price-time priority central limit order book (CLOB).
+
+Design notes
+------------
+* Prices are stored as **integer ticks**. Float prices are only used at the API
+  boundary, so there is no float-key aliasing (``0.1 + 0.2`` vs ``0.3``) and
+  off-grid prices are rejected rather than silently creating a new level.
+* Each side keeps an ascending list of *sort keys* (``tick`` for bids,
+  ``-tick`` for asks). The best price is always the **last** element, so reading
+  the touch and removing an exhausted touch level are both O(1).
+* Each level is an ``OrderedDict`` keyed by order id: FIFO for matching and
+  O(1) removal for cancels.
+* Aggregate quantity per level is maintained incrementally, so ``depth()`` is
+  O(levels requested).
+
+Complexity (L = price levels on a side):
+
+==================  ===============================
+add (new level)     O(log L) search + O(L) memmove
+add (existing)      O(1)
+cancel              O(1), plus O(log L) if the level empties
+modify (reduce)     O(1), keeps queue priority
+match               O(1) per fill / per level crossed
+==================  ===============================
+"""
+
 from __future__ import annotations
 
-import bisect
-from collections import deque
-from dataclasses import dataclass
-from typing import Deque, Dict, List, Optional, Tuple
+import math
+from bisect import bisect_left, insort
+from collections import OrderedDict
+from collections.abc import Iterator
+from decimal import Decimal
 
 from .order import Order
-from .types import Fill, Side
+from .types import (
+    ExecutionReport,
+    Fill,
+    OrderRejected,
+    OrderStatus,
+    OrderType,
+    Side,
+    STPMode,
+    TimeInForce,
+)
+
+_NEG_INF = -math.inf
+
+# Fast record construction for the hot path (bypasses NamedTuple.__new__'s
+# Python-level argument handling; field order must match ExecutionReport).
+_report = tuple.__new__
+_ER = ExecutionReport
+_NEW = OrderStatus.NEW
+_PARTIAL = OrderStatus.PARTIALLY_FILLED
+_FILLED = OrderStatus.FILLED
+_CANCELED = OrderStatus.CANCELED
+if ExecutionReport._fields != (
+    "order_id",
+    "status",
+    "fills",
+    "resting_qty",
+    "canceled_qty",
+    "stp_canceled",
+    "reason",
+):  # pragma: no cover - guards the positional construction above
+    raise ImportError("ExecutionReport field order changed; update book._execute")
 
 
-@dataclass
-class Level:
-    price: float
-    queue: Deque[Order]  # FIFO at a price level
+class _BookSide:
+    """One side of the book, indexed by integer tick."""
+
+    __slots__ = ("keys", "levels", "qty", "side", "sign")
+
+    def __init__(self, side: Side) -> None:
+        self.side = side
+        self.sign = 1 if side is Side.BUY else -1
+        self.levels: dict[int, OrderedDict[str, Order]] = {}
+        self.keys: list[int] = []  # ascending sort keys; best price is keys[-1]
+        self.qty: dict[int, int] = {}
+
+    def best_tick(self) -> int | None:
+        return self.sign * self.keys[-1] if self.keys else None
+
+    def add(self, tick: int, order: Order) -> None:
+        level = self.levels.get(tick)
+        if level is None:
+            level = self.levels[tick] = OrderedDict()
+            insort(self.keys, self.sign * tick)
+            self.qty[tick] = 0
+        level[order.order_id] = order
+        self.qty[tick] += order.qty
+
+    def remove(self, tick: int, order: Order) -> None:
+        level = self.levels[tick]
+        del level[order.order_id]
+        self.qty[tick] -= order.qty
+        if not level:
+            self.drop_level(tick)
+
+    def drop_level(self, tick: int) -> None:
+        del self.levels[tick]
+        del self.qty[tick]
+        key = self.sign * tick
+        if self.keys[-1] == key:
+            self.keys.pop()
+        else:
+            del self.keys[bisect_left(self.keys, key)]
+
+    def ticks(self) -> Iterator[int]:
+        """Ticks from best to worst."""
+        s = self.sign
+        for k in reversed(self.keys):
+            yield s * k
 
 
 class LimitOrderBook:
+    """Price-time priority limit order book.
+
+    Parameters
+    ----------
+    tick_size:
+        Minimum price increment. Limit prices must lie on this grid.
+    stp:
+        Self-trade prevention policy, applied when an incoming order would
+        trade against a resting order with the same (non-``None``) ``owner``.
+
+    Order entry
+    -----------
+    ``submit(order)`` is the primary entry point and returns an
+    :class:`ExecutionReport`; it never raises for business rejections.
+    ``place_limit`` / ``place_market`` are conveniences that return the list of
+    fills and raise :class:`OrderRejected` if the book refuses the order.
     """
-    Price-time priority central limit order book (CLOB).
 
-    - Bids sorted descending, asks sorted ascending
-    - FIFO within each price level
-    - Supports: limit, market, cancel, modify (with priority semantics)
-    - Maintains O(1) per-level aggregated qty for fast depth()
-    """
+    def __init__(self, tick_size: float = 0.01, *, stp: STPMode = STPMode.NONE) -> None:
+        if not math.isfinite(tick_size) or tick_size <= 0:
+            raise ValueError("tick_size must be a positive finite number")
+        self.tick_size = float(tick_size)
+        self.stp = STPMode(stp)
+        exponent = Decimal(repr(self.tick_size)).normalize().as_tuple().exponent
+        self._decimals = max(0, -exponent) if isinstance(exponent, int) else 0
+        self._bids = _BookSide(Side.BUY)
+        self._asks = _BookSide(Side.SELL)
+        # order_id -> (order, tick) for every resting order
+        self._orders: dict[str, tuple[Order, int]] = {}
+        self._px_cache: dict[int, float] = {}
 
-    def __init__(self) -> None:
-        self._bids: Dict[float, Deque[Order]] = {}
-        self._asks: Dict[float, Deque[Order]] = {}
+    # ------------------------------------------------------------------ #
+    # Price grid                                                          #
+    # ------------------------------------------------------------------ #
 
-        self._bid_prices: List[float] = []  # sorted desc
-        self._ask_prices: List[float] = []  # sorted asc
+    def price_of(self, tick: int) -> float:
+        """Float price of an integer tick, rounded to the grid's precision."""
+        px = self._px_cache.get(tick)
+        if px is None:
+            px = self._px_cache[tick] = round(tick * self.tick_size, self._decimals)
+        return px
 
-        # price -> total qty at price (cached)
-        self._bid_qty: Dict[float, int] = {}
-        self._ask_qty: Dict[float, int] = {}
+    def to_ticks(self, price: float) -> int:
+        """Integer tick of an on-grid price. Raises ``ValueError`` if off-grid."""
+        tick = self._tick_or_none(price)
+        if tick is None:
+            raise ValueError(f"price {price!r} is not a multiple of tick size {self.tick_size}")
+        return tick
 
-        # order_id -> (side, price)
-        self._id_map: Dict[str, Tuple[Side, float]] = {}
+    def round_price(self, price: float, side: Side) -> float:
+        """Round a price onto the grid *passively*: bids down, asks up."""
+        x = price / self.tick_size
+        nearest = round(x)
+        if abs(x - nearest) <= 1e-6:
+            return self.price_of(int(nearest))
+        return self.price_of(math.floor(x) if side is Side.BUY else math.ceil(x))
 
-    # --------- Public API ---------
+    def _tick_or_none(self, price: float) -> int | None:
+        x = price / self.tick_size
+        tick = round(x)
+        if abs(x - tick) > 1e-6:
+            return None
+        return int(tick)
 
-    def best_bid(self) -> Optional[float]:
-        return self._bid_prices[0] if self._bid_prices else None
+    # ------------------------------------------------------------------ #
+    # Market data                                                         #
+    # ------------------------------------------------------------------ #
 
-    def best_ask(self) -> Optional[float]:
-        return self._ask_prices[0] if self._ask_prices else None
+    def best_bid(self) -> float | None:
+        keys = self._bids.keys
+        return self.price_of(keys[-1]) if keys else None
 
-    def midprice(self) -> Optional[float]:
-        b = self.best_bid()
-        a = self.best_ask()
+    def best_ask(self) -> float | None:
+        keys = self._asks.keys
+        return self.price_of(-keys[-1]) if keys else None
+
+    def midprice(self) -> float | None:
+        b, a = self._bids.keys, self._asks.keys
+        if not b or not a:
+            return None
+        return (self.price_of(b[-1]) + self.price_of(-a[-1])) / 2.0
+
+    def spread(self) -> float | None:
+        b, a = self.best_bid(), self.best_ask()
         if b is None or a is None:
             return None
-        return (b + a) / 2.0
+        return round(a - b, self._decimals)
 
-    def top_of_book(self) -> dict:
+    def microprice(self) -> float | None:
+        """Size-weighted mid: leans toward the side with *less* resting size,
+        i.e. toward where the price is more likely to move next."""
+        bt, at = self._bids.best_tick(), self._asks.best_tick()
+        if bt is None or at is None:
+            return None
+        qb, qa = self._bids.qty[bt], self._asks.qty[at]
+        b, a = self.price_of(bt), self.price_of(at)
+        return (b * qa + a * qb) / (qa + qb)
+
+    def top_of_book(self) -> dict[str, float | None]:
         return {"best_bid": self.best_bid(), "best_ask": self.best_ask(), "mid": self.midprice()}
 
-    def depth(self, levels: int = 5) -> dict:
-        bids = [(p, self._bid_qty.get(p, 0)) for p in self._bid_prices[:levels]]
-        asks = [(p, self._ask_qty.get(p, 0)) for p in self._ask_prices[:levels]]
-        return {"bids": bids, "asks": asks}
+    def depth(self, levels: int = 5) -> dict[str, list[tuple[float, int]]]:
+        """Aggregated L2 depth, best price first."""
+        out: dict[str, list[tuple[float, int]]] = {}
+        for name, side in (("bids", self._bids), ("asks", self._asks)):
+            rows: list[tuple[float, int]] = []
+            for tick in side.ticks():
+                if len(rows) >= levels:
+                    break
+                rows.append((self.price_of(tick), side.qty[tick]))
+            out[name] = rows
+        return out
 
-    def place_limit(self, order: Order) -> List[Fill]:
-        """
-        Place a LIMIT order:
-        - Match immediately if crossing.
-        - Rest remainder (if any) on the book.
-        Returns fills in execution order.
-        """
-        fills: List[Fill]
-        if order.side == Side.BUY:
-            fills = self._match_buy(order)
-        else:
-            fills = self._match_sell(order)
+    def volume_at(self, side: Side, price: float) -> int:
+        tick = self._tick_or_none(price)
+        if tick is None:
+            return 0
+        book = self._bids if side is Side.BUY else self._asks
+        return book.qty.get(tick, 0)
 
-        if order.qty > 0:
-            self._rest(order)
+    def get_order(self, order_id: str) -> Order | None:
+        entry = self._orders.get(order_id)
+        return entry[0] if entry is not None else None
 
-        return fills
+    def queue_ahead(self, order_id: str) -> int | None:
+        """Quantity resting ahead of ``order_id`` at its price level (O(queue))."""
+        entry = self._orders.get(order_id)
+        if entry is None:
+            return None
+        order, tick = entry
+        book = self._bids if order.side is Side.BUY else self._asks
+        ahead = 0
+        for oid, o in book.levels[tick].items():
+            if oid == order_id:
+                return ahead
+            ahead += o.qty
+        raise AssertionError("order index out of sync with level")  # pragma: no cover
 
-    def place_market(self, order: Order) -> List[Fill]:
-        """
-        Place a MARKET order:
-        - Consumes liquidity immediately
-        - Never rests on the book
-        """
-        if order.side == Side.BUY:
-            return self._match_buy(order, crossing_price=float("inf"))
-        else:
-            return self._match_sell(order, crossing_price=0.0)
+    def __contains__(self, order_id: object) -> bool:
+        return order_id in self._orders
+
+    def __len__(self) -> int:
+        return len(self._orders)
+
+    def __repr__(self) -> str:
+        return (
+            f"LimitOrderBook(tick_size={self.tick_size}, best_bid={self.best_bid()}, "
+            f"best_ask={self.best_ask()}, orders={len(self)})"
+        )
+
+    # ------------------------------------------------------------------ #
+    # Order entry                                                         #
+    # ------------------------------------------------------------------ #
+
+    def submit(self, order: Order) -> ExecutionReport:
+        """Process an order according to its ``order_type`` / ``tif`` / ``post_only``."""
+        return self._execute(order, market=order.order_type is OrderType.MARKET)
+
+    def place_limit(self, order: Order) -> list[Fill]:
+        """Match a limit order and rest any remainder (subject to ``tif``)."""
+        report = self._execute(order, market=False)
+        if report.status is OrderStatus.REJECTED:
+            raise OrderRejected(report)
+        return list(report.fills)
+
+    def place_market(self, order: Order) -> list[Fill]:
+        """Execute ``order`` as a market order (its price is ignored); never rests."""
+        report = self._execute(order, market=True)
+        if report.status is OrderStatus.REJECTED:
+            raise OrderRejected(report)
+        return list(report.fills)
 
     def cancel(self, order_id: str) -> bool:
-        """
-        Cancel an order by id. Returns True if found & removed.
-        """
-        info = self._id_map.get(order_id)
-        if info is None:
+        """Remove a resting order. Returns ``False`` if it is not on the book."""
+        entry = self._orders.pop(order_id, None)
+        if entry is None:
             return False
-
-        side, price = info
-        book = self._bids if side == Side.BUY else self._asks
-        prices = self._bid_prices if side == Side.BUY else self._ask_prices
-        agg = self._bid_qty if side == Side.BUY else self._ask_qty
-
-        q = book.get(price)
-        if q is None:
-            # inconsistent but handle gracefully
-            del self._id_map[order_id]
-            return False
-
-        new_q: Deque[Order] = deque()
-        removed = False
-        removed_qty = 0
-
-        while q:
-            o = q.popleft()
-            if o.order_id == order_id and not removed:
-                removed = True
-                removed_qty = o.qty
-                continue
-            new_q.append(o)
-
-        if not removed:
-            # put the queue back to avoid losing orders
-            book[price] = new_q
-            return False
-
-        # update aggregates
-        agg[price] = agg.get(price, 0) - removed_qty
-
-        if new_q:
-            book[price] = new_q
-            # keep agg entry (could be 0 only if bug; clamp not necessary but safe)
-            if agg.get(price, 0) <= 0:
-                agg[price] = sum(o.qty for o in new_q)
-        else:
-            # remove empty level
-            book.pop(price, None)
-            agg.pop(price, None)
-            self._remove_price(prices, price)
-
-        del self._id_map[order_id]
+        order, tick = entry
+        (self._bids if order.side is Side.BUY else self._asks).remove(tick, order)
         return True
 
     def modify(
@@ -150,174 +301,223 @@ class LimitOrderBook:
         *,
         new_price: float | None = None,
         new_qty: int | None = None,
-        ts: int,
-    ) -> bool:
+        ts: int | None = None,
+    ) -> ExecutionReport:
+        """Amend a resting order with exchange-style priority semantics.
+
+        * same price and quantity reduced (or unchanged) -> amended in place, keeps priority
+        * price change or quantity increase -> loses priority (cancel/replace);
+          a new price that crosses the spread trades immediately and the fills
+          are returned in the report
+        * ``new_qty == 0`` -> cancel
+
+        Invalid requests are REJECTED and leave the order untouched.
         """
-        Modify semantics (exchange-style):
-        - Reduce qty only (no price change) => keeps priority
-        - Increase qty or change price => loses priority (cancel + reinsert with new ts)
-        """
-        info = self._id_map.get(order_id)
-        if info is None:
-            return False
+        entry = self._orders.get(order_id)
+        if entry is None:
+            return self._reject(order_id, "unknown order id")
+        order, tick = entry
 
-        side, price = info
-        book = self._bids if side == Side.BUY else self._asks
-        agg = self._bid_qty if side == Side.BUY else self._ask_qty
+        if new_qty is not None and new_qty < 0:
+            return self._reject(order_id, "new_qty must be >= 0")
+        new_tick = tick
+        if new_price is not None:
+            if not math.isfinite(new_price) or new_price <= 0:
+                return self._reject(order_id, "price must be positive")
+            parsed = self._tick_or_none(new_price)
+            if parsed is None:
+                return self._reject(order_id, "price not on tick grid")
+            new_tick = parsed
 
-        q = book.get(price)
-        if q is None:
-            return False
-
-        target: Optional[Order] = None
-        for o in q:
-            if o.order_id == order_id:
-                target = o
-                break
-        if target is None:
-            return False
-
-        # qty=0 means cancel
         if new_qty == 0:
-            return self.cancel(order_id)
+            remaining = order.qty
+            self.cancel(order_id)
+            return ExecutionReport(order_id, OrderStatus.CANCELED, canceled_qty=remaining)
 
-        # qty reduction only (keeps priority)
-        if new_price is None and new_qty is not None and 0 < new_qty < target.qty:
-            delta = target.qty - new_qty
-            target.qty = new_qty
-            agg[price] = agg.get(price, 0) - delta
-            return True
+        target = order.qty if new_qty is None else new_qty
+        book = self._bids if order.side is Side.BUY else self._asks
+        if new_tick == tick and target <= order.qty:
+            book.qty[tick] -= order.qty - target
+            order.qty = target
+            return ExecutionReport(order_id, OrderStatus.NEW, resting_qty=target)
 
-        # otherwise lose priority => cancel + reinsert
-        old_price = target.price
-        old_qty = target.qty
+        if order.post_only:
+            opp = self._asks if order.side is Side.BUY else self._bids
+            if opp.keys and opp.keys[-1] >= opp.sign * new_tick:
+                return self._reject(order_id, "post-only order would cross")
 
-        if not self.cancel(order_id):
-            return False
+        self.cancel(order_id)
+        order.price = self.price_of(new_tick)
+        order.qty = target
+        if ts is not None:
+            order.ts = ts
+        return self._execute(order, market=False)
 
-        price2 = new_price if new_price is not None else old_price
-        qty2 = new_qty if new_qty is not None else old_qty
-        if qty2 <= 0 or price2 <= 0:
-            return False
-
-        self.place_limit(Order(order_id=order_id, side=side, price=float(price2), qty=int(qty2), ts=ts))
-        return True
-
-    # --------- Internal helpers ---------
-
-    def _rest(self, order: Order) -> None:
-        book = self._bids if order.side == Side.BUY else self._asks
-        prices = self._bid_prices if order.side == Side.BUY else self._ask_prices
-        agg = self._bid_qty if order.side == Side.BUY else self._ask_qty
-
-        if order.price not in book:
-            book[order.price] = deque()
-            self._insert_price(prices, order.price, descending=(order.side == Side.BUY))
-            agg[order.price] = 0
-
-        book[order.price].append(order)
-        agg[order.price] = agg.get(order.price, 0) + order.qty
-        self._id_map[order.order_id] = (order.side, order.price)
-
-    def _match_buy(self, buy: Order, *, crossing_price: Optional[float] = None) -> List[Fill]:
-        fills: List[Fill] = []
-        effective_price = crossing_price if crossing_price is not None else buy.price
-
-        # Buy crosses if best ask <= effective_price
-        while buy.qty > 0 and self._ask_prices:
-            best_ask = self._ask_prices[0]
-            if best_ask > effective_price:
-                break
-
-            ask_q = self._asks[best_ask]
-            maker = ask_q[0]  # FIFO at this price
-            traded = min(buy.qty, maker.qty)
-
-            fills.append(
-                Fill(
-                    taker_order_id=buy.order_id,
-                    maker_order_id=maker.order_id,
-                    price=best_ask,
-                    qty=traded,
-                )
-            )
-
-            buy.qty -= traded
-            maker.qty -= traded
-
-            # update aggregated ask qty
-            self._ask_qty[best_ask] = self._ask_qty.get(best_ask, 0) - traded
-
-            if maker.qty == 0:
-                ask_q.popleft()
-                self._id_map.pop(maker.order_id, None)
-
-                if not ask_q:
-                    self._asks.pop(best_ask, None)
-                    self._ask_prices.pop(0)
-                    self._ask_qty.pop(best_ask, None)
-
-        return fills
-
-    def _match_sell(self, sell: Order, *, crossing_price: Optional[float] = None) -> List[Fill]:
-        fills: List[Fill] = []
-        effective_price = crossing_price if crossing_price is not None else sell.price
-
-        # Sell crosses if best bid >= effective_price
-        while sell.qty > 0 and self._bid_prices:
-            best_bid = self._bid_prices[0]
-            if best_bid < effective_price:
-                break
-
-            bid_q = self._bids[best_bid]
-            maker = bid_q[0]
-            traded = min(sell.qty, maker.qty)
-
-            fills.append(
-                Fill(
-                    taker_order_id=sell.order_id,
-                    maker_order_id=maker.order_id,
-                    price=best_bid,
-                    qty=traded,
-                )
-            )
-
-            sell.qty -= traded
-            maker.qty -= traded
-
-            # update aggregated bid qty
-            self._bid_qty[best_bid] = self._bid_qty.get(best_bid, 0) - traded
-
-            if maker.qty == 0:
-                bid_q.popleft()
-                self._id_map.pop(maker.order_id, None)
-
-                if not bid_q:
-                    self._bids.pop(best_bid, None)
-                    self._bid_prices.pop(0)
-                    self._bid_qty.pop(best_bid, None)
-
-        return fills
+    # ------------------------------------------------------------------ #
+    # Internals                                                           #
+    # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _insert_price(prices: List[float], price: float, *, descending: bool) -> None:
-        """
-        Insert a new price into an already-sorted list without resorting the entire list.
-        - asks: ascending
-        - bids: descending
-        """
-        if descending:
-            # maintain descending order by bisecting on negative values
-            negs = [-p for p in prices]
-            idx = bisect.bisect_left(negs, -price)
-            prices.insert(idx, price)
+    def _reject(order_id: str, reason: str) -> ExecutionReport:
+        return ExecutionReport(order_id, OrderStatus.REJECTED, reason=reason)
+
+    def _execute(self, order: Order, *, market: bool) -> ExecutionReport:
+        # Hot path. Validation, the crossing test and resting are inlined, and
+        # reports are built with ``_report`` (tuple.__new__) to skip the
+        # Python-level NamedTuple constructor.
+        oid = order.order_id
+        orders = self._orders
+        if oid in orders:
+            return self._reject(oid, "duplicate order id")
+        if order.qty <= 0:
+            return self._reject(oid, "qty must be positive")
+
+        is_buy = order.side is Side.BUY
+        opp = self._asks if is_buy else self._bids
+        opp_keys = opp.keys
+        tick = 0
+        stop_key: float = _NEG_INF
+        if not market:
+            price = order.price
+            if price is None:
+                return self._reject(oid, "limit order requires a price")
+            x = price / self.tick_size
+            tick = round(x)
+            if abs(x - tick) > 1e-6:
+                return self._reject(oid, "price not on tick grid")
+            if tick <= 0:
+                return self._reject(oid, "price must be positive")
+            # A level crosses iff its sort key >= stop_key (see _BookSide).
+            stop_key = opp.sign * tick
+            if order.post_only and opp_keys and opp_keys[-1] >= stop_key:
+                return self._reject(oid, "post-only order would cross")
+
+        tif = order.tif
+        if tif is TimeInForce.FOK and not self._can_fill(order, opp, stop_key):
+            killed, order.qty = order.qty, 0
+            return _report(_ER, (oid, _CANCELED, (), 0, killed, (), None))
+
+        if opp_keys and opp_keys[-1] >= stop_key:
+            fill_list, stp_list, halted = self._match(order, opp, stop_key)
+            fills: tuple[Fill, ...] = tuple(fill_list)
+            stp_ids: tuple[str, ...] = tuple(stp_list) if stp_list else ()
+        else:  # passive fast path: nothing to match against
+            fills, stp_ids, halted = (), (), False
+
+        remaining = order.qty
+        if remaining == 0:
+            return _report(_ER, (oid, _FILLED, fills, 0, 0, stp_ids, None))
+        if market or halted or tif is not TimeInForce.GTC:
+            order.qty = 0
+            return _report(_ER, (oid, _CANCELED, fills, 0, remaining, stp_ids, None))
+
+        order.price = self.price_of(tick)
+        book = self._bids if is_buy else self._asks
+        level = book.levels.get(tick)
+        if level is None:
+            book.add(tick, order)
         else:
-            idx = bisect.bisect_left(prices, price)
-            prices.insert(idx, price)
+            level[oid] = order
+            book.qty[tick] += remaining
+        orders[oid] = (order, tick)
+        return _report(_ER, (oid, _PARTIAL if fills else _NEW, fills, remaining, 0, stp_ids, None))
 
-    @staticmethod
-    def _remove_price(prices: List[float], price: float) -> None:
-        for i, p in enumerate(prices):
-            if p == price:
-                prices.pop(i)
-                return
+    def _match(self, taker: Order, opp: _BookSide, stop_key: float) -> tuple[list[Fill], list[str], bool]:
+        """Sweep ``opp`` from the touch while levels cross. Returns
+        ``(fills, stp_canceled_ids, halted_by_stp)``. Hot path: keep it lean."""
+        fills: list[Fill] = []
+        stp_ids: list[str] = []
+        keys, levels, qtys, sign = opp.keys, opp.levels, opp.qty, opp.sign
+        orders = self._orders
+        owner = taker.owner
+        stp = self.stp
+        check_stp = owner is not None and stp is not STPMode.NONE
+        tid, tside, tts = taker.order_id, taker.side, taker.ts
+
+        while taker.qty and keys and keys[-1] >= stop_key:
+            tick = sign * keys[-1]
+            level = levels[tick]
+            price = self.price_of(tick)
+            while taker.qty and level:
+                maker = next(iter(level.values()))
+                if check_stp and maker.owner == owner:
+                    if stp is STPMode.CANCEL_INCOMING:
+                        return fills, stp_ids, True
+                    level.popitem(last=False)
+                    qtys[tick] -= maker.qty
+                    del orders[maker.order_id]
+                    stp_ids.append(maker.order_id)
+                    continue
+                q = taker.qty if taker.qty < maker.qty else maker.qty
+                fills.append(Fill(tid, maker.order_id, price, q, tside, tts))
+                taker.qty -= q
+                maker.qty -= q
+                qtys[tick] -= q
+                if not maker.qty:
+                    level.popitem(last=False)
+                    del orders[maker.order_id]
+            if not level:
+                del levels[tick]
+                del qtys[tick]
+                keys.pop()
+        return fills, stp_ids, False
+
+    def _can_fill(self, taker: Order, opp: _BookSide, stop_key: float) -> bool:
+        """Would ``taker`` be completely filled right now? (FOK pre-check, no side effects.)"""
+        need = taker.qty
+        owner = taker.owner
+        check_stp = owner is not None and self.stp is not STPMode.NONE
+        for key in reversed(opp.keys):
+            if key < stop_key:
+                break
+            tick = opp.sign * key
+            if not check_stp:
+                need -= opp.qty[tick]
+                if need <= 0:
+                    return True
+                continue
+            for maker in opp.levels[tick].values():
+                if maker.owner == owner:
+                    if self.stp is STPMode.CANCEL_INCOMING:
+                        return False
+                    continue
+                need -= maker.qty
+                if need <= 0:
+                    return True
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Debugging                                                           #
+    # ------------------------------------------------------------------ #
+
+    def check_invariants(self) -> None:
+        """Verify internal consistency; raises ``AssertionError`` on corruption.
+
+        O(n) — intended for tests and debugging, not the hot path.
+        """
+
+        def require(cond: bool, msg: str) -> None:
+            if not cond:
+                raise AssertionError(msg)
+
+        seen: set[str] = set()
+        for book in (self._bids, self._asks):
+            require(book.keys == sorted(set(book.keys)), f"{book.side} keys unsorted or duplicated")
+            ticks = {book.sign * k for k in book.keys}
+            require(ticks == set(book.levels) == set(book.qty), f"{book.side} level index mismatch")
+            for tick, level in book.levels.items():
+                require(len(level) > 0, f"{book.side} empty level at tick {tick}")
+                require(
+                    book.qty[tick] == sum(o.qty for o in level.values()),
+                    f"{book.side} cached qty mismatch at tick {tick}",
+                )
+                for oid, o in level.items():
+                    require(o.order_id == oid, f"level key {oid!r} != order id {o.order_id!r}")
+                    require(o.qty > 0, f"non-positive qty resting: {oid}")
+                    require(o.side is book.side, f"order {oid} on wrong side")
+                    entry = self._orders.get(oid)
+                    require(entry is not None and entry[0] is o and entry[1] == tick, f"index mismatch for {oid}")
+                    seen.add(oid)
+        require(seen == set(self._orders), "order index contains orders not on the book")
+        bb, ba = self._bids.best_tick(), self._asks.best_tick()
+        require(bb is None or ba is None or bb < ba, f"book is crossed: bid {bb} >= ask {ba}")

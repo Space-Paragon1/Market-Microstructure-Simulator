@@ -1,121 +1,162 @@
-from __future__ import annotations
-from dataclasses import dataclass
-from typing import List, Optional
+"""Market-making strategies beyond the symmetric baseline."""
 
-from microbook import LimitOrderBook, Order, Side
-from microbook.sim.strategy import Strategy, Action
-from microbook.sim.events import EventType
+from __future__ import annotations
+
+import math
+from collections import deque
+from dataclasses import dataclass
+from itertools import pairwise
+
+from microbook import LimitOrderBook
 from microbook.sim.metrics import imbalance
+from microbook.sim.strategy import TwoSidedQuoter
+
+Quotes = tuple[float | None, float | None, int, int]
 
 
 @dataclass
 class AdaptiveMMConfig:
-    tick_size: float = 1.0
-    base_half_spread_ticks: int = 1
+    tick_size: float | None = None  # quoting unit; None = the book's tick
+    base_half_spread_ticks: float = 1.0
     size: int = 5
     tick_interval: int = 10
+    latency: int = 0
 
     # inventory control
     inv_target: int = 0
-    inv_limit: int = 25
-    inv_k: float = 0.08  # how aggressively we skew quotes by inventory
+    inv_limit: int = 25  # stop quoting the side that would grow |inventory| beyond this
+    inv_k: float = 0.08  # ticks of quote shift per share of inventory error
+    max_skew_ticks: float = 6.0
 
-    # volatility control (uses recent mid changes)
+    # volatility control: widen by vol_k * (mean |mid change| per refresh)
     vol_window: int = 30
-    vol_k: float = 3.0   # widen spread as volatility increases
+    vol_k: float = 3.0
 
-    # imbalance leaning
-    imb_k: float = 2.0   # shift quotes based on L2 imbalance
+    # order-book imbalance leaning (ticks of shift at full imbalance)
+    imb_k: float = 2.0
 
 
-class AdaptiveMarketMaker(Strategy):
+class AdaptiveMarketMaker(TwoSidedQuoter):
+    """Heuristic market maker with three controls:
+
+    * **volatility-aware spread** — the half-spread widens with the mean
+      absolute mid change over the last ``vol_window`` refreshes;
+    * **inventory skew** — both quotes shift *against* the position
+      (long -> lower, to sell; short -> higher, to buy), plus a hard limit;
+    * **imbalance lean** — both quotes shift *toward* the heavier side of the
+      top-3 book (bid-heavy -> higher), anticipating the next price move.
+
+    Skews shift the quote *centre*; they never change the spread width, so the
+    bid stays strictly below the ask.
     """
-    Adaptive market maker:
-    - Dynamic spread widens with volatility
-    - Inventory-aware skew (pushes toward flattening inventory)
-    - Optional order-book imbalance leaning
-    """
 
-    def __init__(self, cfg: AdaptiveMMConfig, name: str = "amm") -> None:
-        super().__init__(name=name)
+    def __init__(self, cfg: AdaptiveMMConfig | None = None, name: str = "amm") -> None:
+        cfg = cfg or AdaptiveMMConfig()
+        super().__init__(name, tick_interval=cfg.tick_interval, latency=cfg.latency)
         self.cfg = cfg
-
-        self._last_quote_t = -10**9
-        self._bid_id = f"{name}_bid"
-        self._ask_id = f"{name}_ask"
-        self.my_order_ids.update([self._bid_id, self._ask_id])
-
-        self._mid_hist: List[float] = []
-
-    def _record_mid(self, lob: LimitOrderBook) -> Optional[float]:
-        m = lob.midprice()
-        if m is None:
-            return None
-        self._mid_hist.append(float(m))
-        if len(self._mid_hist) > self.cfg.vol_window:
-            self._mid_hist.pop(0)
-        return float(m)
+        self._mid_hist: deque[float] = deque(maxlen=max(2, cfg.vol_window))
 
     def _vol_proxy(self) -> float:
-        # mean absolute mid change (simple, stable)
-        if len(self._mid_hist) < 2:
+        h = self._mid_hist
+        if len(h) < 2:
             return 0.0
-        diffs = [abs(self._mid_hist[i] - self._mid_hist[i-1]) for i in range(1, len(self._mid_hist))]
-        return sum(diffs) / len(diffs)
+        return sum(abs(b - a) for a, b in pairwise(h)) / (len(h) - 1)
 
-    def on_tick(self, now: int, lob: LimitOrderBook) -> List[Action]:
-        if now - self._last_quote_t < self.cfg.tick_interval:
-            return []
-
-        mid = self._record_mid(lob)
+    def compute_quotes(self, now: int, lob: LimitOrderBook) -> Quotes | None:
+        mid = lob.midprice()
         if mid is None:
-            return []
+            return None
+        cfg = self.cfg
+        self._mid_hist.append(mid)
+        q = cfg.tick_size or lob.tick_size
 
-        # --- dynamic half spread in ticks ---
-        vol = self._vol_proxy()
-        half_spread = self.cfg.base_half_spread_ticks + int(self.cfg.vol_k * vol / self.cfg.tick_size)
+        half = (cfg.base_half_spread_ticks + cfg.vol_k * self._vol_proxy() / q) * q
 
-        # --- inventory skew (in ticks) ---
         inv = self.portfolio.position
-        inv_err = inv - self.cfg.inv_target
-        inv_skew = int(self.cfg.inv_k * inv_err)  # positive means we’re long -> skew down
+        im = imbalance(lob, levels=3) or 0.0
+        shift_down = cfg.inv_k * (inv - cfg.inv_target) - cfg.imb_k * im
+        shift_down = max(-cfg.max_skew_ticks, min(cfg.max_skew_ticks, shift_down))
+        center = mid - shift_down * q
 
-        # clamp skew so we don’t go crazy
-        inv_skew = max(-self.cfg.base_half_spread_ticks - 5, min(self.cfg.base_half_spread_ticks + 5, inv_skew))
+        bid = center - half if inv < cfg.inv_limit else None
+        ask = center + half if inv > -cfg.inv_limit else None
+        return bid, ask, cfg.size, cfg.size
 
-        # --- imbalance leaning ---
-        im = imbalance(lob, levels=3)
-        imb_skew = 0
-        if im is not None:
-            imb_skew = int(self.cfg.imb_k * im)
 
-        # Combine skews:
-        # long inventory => want to encourage sells: lower bid, lower ask (shift down)
-        # short inventory => shift up
-        total_skew = inv_skew + imb_skew
+@dataclass
+class AvellanedaStoikovConfig:
+    gamma: float = 0.1  # risk aversion
+    k: float = 100.0  # fill-intensity decay: lambda(delta) = A * exp(-k * delta), delta in price units
+    horizon: int = 10_000  # terminal time T
+    # If set, use this constant time-to-horizon instead of T - t (the stationary
+    # "rolling horizon" variant common in practice: the skew does not fade).
+    rolling_tau: int | None = None
+    sigma: float | None = None  # mid volatility per sqrt(time unit); None = estimate online
+    vol_window: int = 50  # mid samples used by the online estimator
+    size: int = 5
+    tick_interval: int = 10
+    inv_limit: int = 50
+    min_half_spread_ticks: float = 0.5
+    latency: int = 0
 
-        bid_px = mid - (half_spread + total_skew) * self.cfg.tick_size
-        ask_px = mid + (half_spread + total_skew) * self.cfg.tick_size
 
-        # Inventory guard: if too long, stop quoting bid; if too short, stop quoting ask
-        quote_bid = inv < self.cfg.inv_limit
-        quote_ask = inv > -self.cfg.inv_limit
+class AvellanedaStoikovMarketMaker(TwoSidedQuoter):
+    """Avellaneda & Stoikov (2008), *High-frequency trading in a limit order book*.
 
-        actions: List[Action] = []
+    With inventory ``q``, mid ``s``, volatility ``sigma`` and time to horizon
+    ``tau = T - t``, the optimal quotes are centred on the reservation price::
 
-        # Cancel existing quotes each refresh
-        actions.append(Action(now, EventType.CANCEL, {"order_id": self._bid_id}))
-        actions.append(Action(now, EventType.CANCEL, {"order_id": self._ask_id}))
+        r     = s - q * gamma * sigma^2 * tau
+        delta = gamma * sigma^2 * tau + (2 / gamma) * ln(1 + gamma / k)    # total spread
 
-        if quote_bid:
-            actions.append(Action(now, EventType.SUBMIT, {
-                "order": Order(self._bid_id, Side.BUY, float(bid_px), self.cfg.size, ts=self._next_ts(now))
-            }))
+    so inventory risk is managed by moving the centre (not by widening). In
+    the finite-horizon form the skew fades as ``t -> T``; with
+    ``rolling_tau`` set, ``tau`` is held constant instead.
+    """
 
-        if quote_ask:
-            actions.append(Action(now, EventType.SUBMIT, {
-                "order": Order(self._ask_id, Side.SELL, float(ask_px), self.cfg.size, ts=self._next_ts(now))
-            }))
+    def __init__(self, cfg: AvellanedaStoikovConfig | None = None, name: str = "as") -> None:
+        cfg = cfg or AvellanedaStoikovConfig()
+        if cfg.gamma <= 0 or cfg.k <= 0:
+            raise ValueError("gamma and k must be positive")
+        super().__init__(name, tick_interval=cfg.tick_interval, latency=cfg.latency)
+        self.cfg = cfg
+        self._samples: deque[tuple[int, float]] = deque(maxlen=max(2, cfg.vol_window))
 
-        self._last_quote_t = now
-        return actions
+    def sigma(self) -> float | None:
+        """Configured sigma, or realized volatility per sqrt(time unit) of sampled mids."""
+        if self.cfg.sigma is not None:
+            return self.cfg.sigma
+        s = self._samples
+        if len(s) < 3:
+            return None
+        pts = list(s)
+        sq = sum((b[1] - a[1]) ** 2 for a, b in pairwise(pts))
+        dt = pts[-1][0] - pts[0][0]
+        return math.sqrt(sq / dt) if dt > 0 else None
+
+    def tau(self, now: int) -> int:
+        if self.cfg.rolling_tau is not None:
+            return self.cfg.rolling_tau
+        return max(self.cfg.horizon - now, 0)
+
+    def reservation_price(self, mid: float, inventory: int, now: int, sigma: float) -> float:
+        return mid - inventory * self.cfg.gamma * sigma**2 * self.tau(now)
+
+    def optimal_spread(self, now: int, sigma: float) -> float:
+        g, k = self.cfg.gamma, self.cfg.k
+        return g * sigma**2 * self.tau(now) + (2.0 / g) * math.log1p(g / k)
+
+    def compute_quotes(self, now: int, lob: LimitOrderBook) -> Quotes | None:
+        mid = lob.midprice()
+        if mid is None:
+            return None
+        cfg = self.cfg
+        self._samples.append((now, mid))
+        sigma = self.sigma() or 0.0
+        inv = self.portfolio.position
+
+        r = self.reservation_price(mid, inv, now, sigma)
+        half = max(self.optimal_spread(now, sigma) / 2.0, cfg.min_half_spread_ticks * lob.tick_size)
+        bid = r - half if inv < cfg.inv_limit else None
+        ask = r + half if inv > -cfg.inv_limit else None
+        return bid, ask, cfg.size, cfg.size
