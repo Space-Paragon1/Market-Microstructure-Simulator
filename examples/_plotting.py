@@ -185,3 +185,127 @@ def plot_market_run(run: dict[str, Any], tick: float, path: Path) -> None:
 
     fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
+
+
+def plot_stylized_facts(summ: dict[str, dict[str, Any]], kurt_dts: tuple[int, ...], acf_dt: int, path: Path) -> None:
+    """Six-panel stylized-facts comparison of the simple and realistic markets."""
+    colors = {"realistic": SERIES[0], "simple": SERIES[1]}
+    labels = {"realistic": "MarketConfig.realistic()", "simple": "MarketConfig() (simple)"}
+    fig, axes = plt.subplots(2, 3, figsize=(13, 7.4), constrained_layout=True)
+
+    def err(ax: Any, xs: list[float], ms: list[tuple[float, float]], color: str, label: str) -> None:
+        ax.errorbar(
+            xs,
+            [m for m, _ in ms],
+            yerr=[1.96 * (0 if math.isnan(s) else s) for _, s in ms],
+            color=color,
+            marker="o",
+            markersize=3.5,
+            capsize=2,
+            elinewidth=0.8,
+            label=label,
+        )
+
+    # (a) tails: complementary CDF of standardized |r|
+    ax = axes[0, 0]
+    anchor = None
+    for m in ("simple", "realistic"):
+        xs = sorted(x for x in summ[m]["std_abs_r100"] if x > 0)
+        n = len(xs)
+        if n:
+            ccdf = [1 - i / n for i in range(n)]
+            ax.plot(xs, ccdf, color=colors[m], linewidth=1.5, label=labels[m])
+            if m == "realistic":
+                anchor = next((c for x, c in zip(xs, ccdf, strict=True) if x >= 2), None)
+    g = [0.5 + 0.05 * i for i in range(90)]
+    ax.plot(g, [math.erfc(x / math.sqrt(2)) for x in g], color=MUTED, linestyle="--", linewidth=1)
+    ax.annotate(
+        "Gaussian",
+        (2.9, math.erfc(2.9 / math.sqrt(2))),
+        xytext=(-52, -4),
+        textcoords="offset points",
+        fontsize=8,
+        color=TEXT_2,
+    )
+    if anchor:
+        ref = [2.0 * 1.1**i for i in range(25)]
+        ax.plot(ref, [anchor * (x / 2) ** -3 for x in ref], color=MUTED, linestyle=":", linewidth=1)
+        ax.annotate(
+            "∝ x⁻³", (8.0, anchor * 4.0**-3), xytext=(4, 4), textcoords="offset points", fontsize=8, color=TEXT_2
+        )
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(0.5, 30)
+    ax.set_ylim(1e-4, 1.2)
+    ax.set_xlabel("|100-step return| / std (log)")
+    ax.set_ylabel("P(|r| > x) (log)")
+    ax.set_title("(a) Fat tails: far heavier than Gaussian")
+
+    # (b) aggregational Gaussianity
+    ax = axes[0, 1]
+    for m in ("simple", "realistic"):
+        err(ax, list(kurt_dts), [summ[m]["kurtosis"][dt] for dt in kurt_dts], colors[m], labels[m])
+    ax.axhline(0, color=AXIS, linewidth=0.8)
+    ax.set_xscale("log")
+    ax.set_xticks(list(kurt_dts), [str(d) for d in kurt_dts])
+    ax.set_xlabel("return horizon (steps, log)")
+    ax.set_ylabel("excess kurtosis (95% CI)")
+    ax.set_title("(b) Tails thin out at longer horizons")
+
+    # (c) return autocorrelation
+    ax = axes[0, 2]
+    for m in ("simple", "realistic"):
+        c = summ[m]["acf_r"]
+        err(ax, [k * acf_dt for k in c], list(c.values()), colors[m], labels[m])
+    ax.axhline(0, color=AXIS, linewidth=0.8)
+    ax.set_xscale("log")
+    ax.set_xlabel(f"lag (steps, log; {acf_dt}-step returns)")
+    ax.set_ylabel("return autocorrelation")
+    ax.set_title("(c) Returns: the simple market's momentum is gone")
+
+    # (d) volatility clustering
+    ax = axes[1, 0]
+    for m in ("simple", "realistic"):
+        c = summ[m]["acf_abs"]
+        err(ax, [k * acf_dt for k in c], list(c.values()), colors[m], labels[m])
+    ax.axhline(0, color=AXIS, linewidth=0.8)
+    ax.set_xscale("log")
+    ax.set_xlabel(f"lag (steps, log; {acf_dt}-step returns)")
+    ax.set_ylabel("|return| autocorrelation")
+    ax.set_title("(d) Volatility clusters")
+
+    # (e) order-sign memory
+    ax = axes[1, 1]
+    for m in ("simple", "realistic"):
+        c = {k: v for k, v in summ[m]["acf_sign"].items() if v[0] > 0}
+        ax.plot(list(c), [v[0] for v in c.values()], color=colors[m], marker="o", markersize=3.5, label=labels[m])
+    lags = [1, 10, 100, 1000]
+    ax.plot(lags, [0.5 * x**-0.5 for x in lags], color=MUTED, linestyle=":", linewidth=1)
+    _end_label(ax, lags[-1], 0.5 * lags[-1] ** -0.5, "real: ∝ lag⁻⁰·⁵")
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlabel("lag (trades, log)")
+    ax.set_ylabel("sign autocorrelation (log; > 0 only)")
+    ax.set_title("(e) Order signs: memory too short")
+
+    # (f) metaorder impact
+    ax = axes[1, 2]
+    bins = summ["realistic"]["impact_bins"]
+    if bins:
+        xs = [b[0] for b in bins]
+        err(ax, xs, [(b[1], b[2]) for b in bins], colors["realistic"], labels["realistic"])
+        lo, hi = min(xs), max(xs)
+        ref_x = [lo * (hi / lo) ** (i / 20) for i in range(21)]
+        ax.plot(ref_x, [0.5 * math.sqrt(x) for x in ref_x], color=MUTED, linestyle=":", linewidth=1)
+        _end_label(ax, ref_x[-1], 0.5 * math.sqrt(ref_x[-1]), "real: 0.5·√(Q/V)")
+        y, _ = summ["realistic"]["impact_Y"]
+        ax.set_title(f"(f) Impact: Y = {y:.2f}, below the √ law")
+    ax.axhline(0, color=AXIS, linewidth=0.8)
+    ax.set_xscale("log")
+    ax.set_xlabel("metaorder size / daily volume (log)")
+    ax.set_ylabel("impact / daily volatility (95% CI)")
+
+    handles, names = axes[0, 1].get_legend_handles_labels()
+    fig.legend(handles, names, loc="outside upper center", ncol=2, frameon=False)
+    fig.savefig(path, dpi=160, bbox_inches="tight")
+    plt.close(fig)
