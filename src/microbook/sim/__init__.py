@@ -1,6 +1,16 @@
 """Event-driven simulation, strategies and analytics built on :mod:`microbook`."""
 
-from .agents import FundamentalValue, InformedConfig, InformedTrader, NoiseConfig, NoiseTrader
+from .agents import (
+    FundamentalValue,
+    HawkesConfig,
+    HawkesProcess,
+    InformedConfig,
+    InformedTrader,
+    MetaorderConfig,
+    MetaorderTrader,
+    NoiseConfig,
+    NoiseTrader,
+)
 from .analytics import TimeSeries, format_table, markouts, pnl_stats, strategy_report
 from .events import Event, EventType
 from .execution_metrics import ExecutionMetrics, FillRecord
@@ -26,12 +36,16 @@ __all__ = [
     "ExecutionMetrics",
     "FillRecord",
     "FundamentalValue",
+    "HawkesConfig",
+    "HawkesProcess",
     "InformedConfig",
     "InformedTrader",
     "Market",
     "MarketConfig",
     "MarketMaker",
     "MarketSimulator",
+    "MetaorderConfig",
+    "MetaorderTrader",
     "NoiseConfig",
     "NoiseTrader",
     "Portfolio",
